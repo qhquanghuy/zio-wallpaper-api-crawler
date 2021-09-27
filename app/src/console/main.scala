@@ -293,7 +293,20 @@ object main extends App {
   }
 
 
-  def categoryProg = {
+  def categoryProg(errorQ: Queue[Throwable]) = {
+    stream.categories(errorQ)
+      .mapMParUnordered(32)(js => db.upsertCategories(js).either)
+      .tap {
+        case Left(throwable) =>
+          errorQ.offer(throwable)
+        case _ => ZIO.unit
+      }
+      .collectRight
+      .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
+  }
+
+
+  def program = {
     for {
       queue <- ZQueue.unbounded[Throwable]
       failuresFiber <- ZStream.fromQueue(queue)
@@ -301,27 +314,11 @@ object main extends App {
         .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
         .fork
 
-      sucessesFiber <- stream.categories(queue)
-        .mapMParUnordered(32)(js => db.upsertCategories(js).either)
-        .tap {
-          case Left(throwable) =>
-            queue.offer(throwable)
-          case _ => ZIO.unit
-        }
-        .collectRight
-        .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
-        .tap(_ => queue.shutdown)
-        .fork
-
-      sucesses <- sucessesFiber.join
+      categoryFiber <- categoryProg(queue).tap(_ => queue.shutdown).fork
       failures <- failuresFiber.join
+      categorySuccesses <- categoryFiber.join
 
-    } yield failures -> sucesses
-  }
-
-
-  def program = {
-    categoryProg
+    } yield failures -> categorySuccesses
 
   }
 
