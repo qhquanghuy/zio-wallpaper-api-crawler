@@ -22,8 +22,13 @@ object api {
   val baseReq = basicRequest
 
   def run[L <: Throwable, R](req: Request[Either[L, R], Effect[Task] with ZioStreams with WebSockets]) = {
-    send(req)
-      .flatMap(res => ZIO.fromEither(res.body))
+    for {
+      _ <- log.info(s"${req.method} ${req.uri}")
+      rawRes <- send(req)
+      _ <- log.info(s"${req.method} ${req.uri} --- ${rawRes.code}")
+      res <- ZIO.fromEither(rawRes.body)
+    } yield res
+
   }
 
 
@@ -38,19 +43,18 @@ object api {
 
 
   def images(limit: Int, offset: Int, width: Int, height: Int) = {
-    baseUri("/images", limit, offset, width, height)
-      .map(uri => baseReq.get(uri).response(asJson[Json]))
-      .flatMap(run)
+    for {
+      uri <- baseUri("/images", limit, offset, width, height)
+      req = baseReq.get(uri).response(asJson[ApiResponse[Json]])
+      res <- run(req)
+    } yield res
   }
 
   def categories(limit: Int, offset: Int, width: Int, height: Int) = {
-    val annotation = "api::categories"
     for {
       uri <- baseUri("/categories", limit, offset, width, height)
-      _ <- log.info(s"$annotation prepare $uri")
       req = baseReq.get(uri).response(asJson[ApiResponse[Category]])
       res <- run(req)
-      _ <- log.info(s"$annotation done $uri")
     } yield res
   }
 

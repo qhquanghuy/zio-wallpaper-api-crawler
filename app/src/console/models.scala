@@ -10,6 +10,20 @@ import reactivemongo.api.bson._
 final case class ApiResponse[A](count: Int, items: List[A])
 final case class Category(id: Int, title: String)
 
+final case class ImageResolution(width: Int, height: Int)
+final case class ImageVariation(
+  resolution: ImageResolution,
+  size: Int,
+  url: String
+)
+
+final case class variations(
+  adapted: ImageVariation,
+  adapted_landscape: ImageVariation,
+  original: ImageVariation,
+  preview_small: ImageVariation,
+)
+
 
 
 final case class DeviceToken(

@@ -2,6 +2,7 @@ package console
 
 import scala.util.Try
 import scala.concurrent.duration.{Duration => ScDuration, _}
+import scala.concurrent.Future
 import java.time.temporal.ChronoUnit
 import java.io.File
 
@@ -36,13 +37,14 @@ import aliases._
 
 
 
+
 object aliases {
   type SttpClient = Has[SttpBackend[Task, ZioStreams with WebSockets]]
   type MongoConf = Has[MongoConfig]
 }
 
 object constants {
-  val limit = 10
+  val limit = 200
 }
 
 
@@ -56,16 +58,16 @@ object stream {
       .mapMPar(2) {
         case (width, height) => api.images(1, 0, width, height)
       }
-      .mapConcat { js =>
-        val base = root.items.each.variations.preview_small.resolution
-        val resolutions = base.json.getAll(js)
+      .mapConcat { res =>
+        val base = root.each.variations.preview_small.resolution
+        val resolutions = base.json.getAll(res.items.asJson)
         val widthLens = root.width.int
         val heightLens = root.height.int
         resolutions.flatMap { resolution =>
-           for {
-             w <- widthLens.getOption(resolution)
-             h <- heightLens.getOption(resolution)
-           } yield w -> h
+          for {
+            w <- widthLens.getOption(resolution)
+            h <- heightLens.getOption(resolution)
+          } yield w -> h
         }
         .toSet
       }
@@ -113,14 +115,32 @@ object stream {
       (800,1280),
       (450,800)
     )
-
-    ZStream.fromIterable(xs)
+    xs
   }
 
   def totalPage(totalItems: Int) = Math.ceil(totalItems.toDouble / constants.limit).toLong
 
-  def images = {
+  def images(errorQ: Queue[Throwable]) = {
 
+    ZStream.fromIterable(dimensions)
+      .map {
+        case (w, h) => w * 3 -> h * 3
+      }
+      .flatMap {
+        case (w, h) => ZStream.fromEffect(offsetStream(api.images(1, 0, w, h).map(_.count))).mapConcat(identity).map(_ -> (w, h))
+      }
+      .chunkN(1).throttleShape(1, Duration.fromScala(250.millis))(_ => 1)
+      .mapMParUnordered(5) {
+        case (offset, (w, h)) => api.images(constants.limit, offset, w, h).either
+      }
+      .tap {
+        case Left(throwable) =>
+          errorQ.offer(throwable)
+        case _ => ZIO.unit
+      }
+      .collectRight
+      .map(_.items)
+      .mapConcat(identity)
   }
 
   def offsetStream[R, E](eff: ZIO[R, E, Int]) = {
@@ -159,13 +179,6 @@ object stream {
 
 }
 
-object jsonutil {
-  def renameField(json: Json, fieldToRename: String, newName: String): Json =
-    (for {
-      value <- json.hcursor.downField(fieldToRename).focus
-      newJson <- json.mapObject(_.add(newName, value)).hcursor.downField(fieldToRename).delete.top
-    } yield newJson).getOrElse(json)
-}
 
 object mongo {
   import reactivemongo.api.{ AsyncDriver, MongoConnection }
@@ -190,7 +203,9 @@ object db {
 
 
   trait Service {
-    def upsertCategories(category: Category): ZIO[Logging, Throwable, Unit]
+    def upsertCategories(categories: Seq[Category]): ZIO[Logging, Throwable, Unit]
+    def upsertImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
+    def upsertImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
     def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int): ZIO[Logging, Throwable, Array[DeviceToken]]
   }
 
@@ -201,24 +216,67 @@ object db {
         val (db, conf) = pair
         lazy val deviceTokens = db.collection("deviceTokens")
         new Service {
+
           private def json2BSONDoc(json: Json) = ZIO.fromEither(jsonToBson(json))
             .collect(new IllegalArgumentException("Inserting Json  must be an Object")) { case doc: BSONDocument => doc }
-          override def upsertCategories(category: Category) = {
-            val collection = db.collection("categories")
-            val action = for {
-              bdoc <- json2BSONDoc(category.asJson)
-              _ <- log.info(s"Loading id: ${category.id}")
-              result <- ZIO.fromFuture { implicit ec =>
-                collection.findAndUpdate(
-                  BSONDocument("id" -> category.id),
-                  BSONDocument("$set" -> bdoc),
-                  upsert = true
-                )
-              }
-              _ <- log.info(s"Done Loading id: ${category.id} " + result.lastError.map(e => s"""|err: ${e.err}|updatedExisting: ${e.updatedExisting}|n: ${e.n}|upserted: ${e.upserted}""").toString())
-            } yield ()
 
-            action
+
+          private def upsert(collectionName: String, xs: Seq[(Json, BSONValue)]) = {
+            val collection = db.collection(collectionName)
+            val (notJsObjs, jsObjs) = xs.map {
+              case (json, id) => jsonToBson(json) -> id
+            }
+            .partition(_._1.isLeft)
+
+            val updateBuilder = collection.update
+            val updatesF = jsObjs.collect {
+              case (Right(bdoc), id) => updateBuilder.element(
+                q = BSONDocument("id" -> id),
+                u = BSONDocument("$set" -> bdoc),
+                upsert = true
+              )
+            }
+
+            val eff = ZIO.fromFuture { implicit ec =>
+              Future.sequence(updatesF).flatMap { updates => updateBuilder.many(updates) }
+            }
+
+            val ids2Upsert = jsObjs.map(_._2)
+
+            for {
+              _ <- if (notJsObjs.nonEmpty) log.error(s"Not Json Object: ${notJsObjs.map(_._2)}") else ZIO.unit
+              _ <- log.info(s"Loading ids: ${ids2Upsert}")
+              result <- eff
+              _ <- log.info(s"Done Loading " +
+                s"id: ${ids2Upsert} " +
+                s"ok = ${result.ok} " +
+                s"n = ${result.n} " +
+                s"nModified = ${result.nModified} " +
+                s"upserted = ${result.upserted} " +
+                s"writeErrors = ${result.writeErrors} " +
+                s"writeConcernError = ${result.writeConcernError} " +
+                s"code = ${result.code} " +
+                s"errmsg = ${result.errmsg} " +
+                s"totalN = ${result.totalN}}"
+              )
+            } yield ()
+          }
+
+          override def upsertCategories(categories: Seq[Category]) = {
+            upsert("categories", categories.map(category => category.asJson -> BSONInteger(category.id)))
+          }
+
+          override def upsertImages(xs: Seq[Json]): ZIO[Logging,Throwable,Unit] = {
+            val images2Upsert = xs.flatMap { js =>
+              root.id.int.getOption(js).map(id => js -> BSONInteger(id))
+            }
+            upsert("images", images2Upsert)
+          }
+          override def upsertImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
+            val variations2Upsert = xs.flatMap { js =>
+              root.id.string.getOption(js).map(id => js -> BSONString(id))
+            }
+            upsert("variations", variations2Upsert)
           }
 
 
@@ -244,9 +302,18 @@ object db {
     }
   }
 
-  def upsertCategories(category: Category) = {
+  def upsertCategories(categories: Seq[Category]) = {
      ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertCategories(category))
+      .flatMap(_.upsertCategories(categories))
+  }
+
+  def upsertImages(xs: Seq[Json]) = {
+    ZIO.access[Has[db.Service]](_.get)
+      .flatMap(_.upsertImages(xs))
+  }
+  def upsertImageVariations(xs: Seq[Json]) = {
+    ZIO.access[Has[db.Service]](_.get)
+      .flatMap(_.upsertImageVariations(xs))
   }
 
   def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int) = {
@@ -254,6 +321,35 @@ object db {
       .flatMap(_.fetch(maybeLastId, pageSize))
   }
 }
+
+object util {
+  def md5HashString(s: String): String = {
+    import java.security.MessageDigest
+    import java.math.BigInteger
+    val md = MessageDigest.getInstance("MD5")
+    val digest = md.digest(s.getBytes)
+    val bigInt = new BigInteger(1,digest)
+    val hashedString = bigInt.toString(16)
+    hashedString
+  }
+}
+
+object logic {
+  def separateImageDataAndVariation(js: Json) = {
+    for {
+      obj <- js.asObject
+      id <- obj("id")
+      variations <- obj("variations").flatMap(_.asObject)
+      variationsJson = variations.asJson
+      adaptedUrl <- root.adapted.url.string.getOption(variationsJson)
+      adapted_landscapeUrl <- root.adapted_landscape.url.string.getOption(variationsJson)
+      originalUrl <- root.original.url.string.getOption(variationsJson)
+      preview_smallUrl <- root.preview_small.url.string.getOption(variationsJson)
+      hash = util.md5HashString(adaptedUrl + adapted_landscapeUrl + originalUrl + preview_smallUrl)
+    } yield obj.remove("variations") -> variations.add("image_id", id).add("id", hash.asJson)
+  }
+}
+
 object main extends App {
 
 
@@ -292,10 +388,14 @@ object main extends App {
     .run(ZSink.collectAllToSet)
   }
 
+  def imageProg(errorQ: Queue[Throwable]) = {
 
-  def categoryProg(errorQ: Queue[Throwable]) = {
-    stream.categories(errorQ)
-      .mapMParUnordered(32)(js => db.upsertCategories(js).either)
+    stream.images(errorQ)
+      .mapM(js => ZIO.fromOption(logic.separateImageDataAndVariation(js)))
+      .grouped(128)
+      .mapMParUnordered(8) { chunk =>
+        (db.upsertImages(chunk.map(_._1.asJson)) <*> db.upsertImageVariations(chunk.map(_._2.asJson))).either
+      }
       .tap {
         case Left(throwable) =>
           errorQ.offer(throwable)
@@ -303,6 +403,27 @@ object main extends App {
       }
       .collectRight
       .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
+  }
+
+
+  def categoryProg(errorQ: Queue[Throwable]) = {
+    stream.categories(errorQ)
+      .grouped(128)
+      .mapMParUnordered(32)(xs => db.upsertCategories(xs).either)
+      .tap {
+        case Left(throwable) =>
+          errorQ.offer(throwable)
+        case _ => ZIO.unit
+      }
+      .collectRight
+      .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
+  }
+
+  def mainProg(errorQ: Queue[Throwable]) = {
+    for {
+      categorySuccesses <- categoryProg(errorQ)
+      imagesSuccesses <- imageProg(errorQ)
+    } yield categorySuccesses
   }
 
 
@@ -314,9 +435,9 @@ object main extends App {
         .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
         .fork
 
-      categoryFiber <- categoryProg(queue).tap(_ => queue.shutdown).fork
+      mainFiber <- mainProg(queue).tap(_ => queue.shutdown).fork
       failures <- failuresFiber.join
-      categorySuccesses <- categoryFiber.join
+      categorySuccesses <- mainFiber.join
 
     } yield failures -> categorySuccesses
 
