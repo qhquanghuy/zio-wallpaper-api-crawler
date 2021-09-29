@@ -120,18 +120,23 @@ object stream {
 
   def totalPage(totalItems: Int) = Math.ceil(totalItems.toDouble / constants.limit).toLong
 
-  def images(errorQ: Queue[Throwable]) = {
-
+  def mkDataStream[R, E, A](dataSource: (Int, Int, Int, Int) => ZIO[R, E, ApiResponse[A]], errorQ: Queue[E]) = {
     ZStream.fromIterable(dimensions)
       .map {
         case (w, h) => w * 3 -> h * 3
       }
       .flatMap {
-        case (w, h) => ZStream.fromEffect(offsetStream(api.images(1, 0, w, h).map(_.count))).mapConcat(identity).map(_ -> (w, h))
+        case (w, h) => ZStream.fromEffect(offsetStream(dataSource(1, 0, w, h).map(_.count))).mapConcat(identity).map(_ -> (w, h)).either
       }
+      .tap {
+        case Left(throwable) =>
+          errorQ.offer(throwable)
+        case _ => ZIO.unit
+      }
+      .collectRight
       .chunkN(1).throttleShape(1, Duration.fromScala(250.millis))(_ => 1)
       .mapMParUnordered(5) {
-        case (offset, (w, h)) => api.images(constants.limit, offset, w, h).either
+        case (offset, (w, h)) => dataSource(constants.limit, offset, w, h).either
       }
       .tap {
         case Left(throwable) =>
@@ -141,6 +146,17 @@ object stream {
       .collectRight
       .map(_.items)
       .mapConcat(identity)
+  }
+
+  def images(errorQ: Queue[Throwable]) = {
+    mkDataStream(api.images, errorQ)
+  }
+
+  def doubleImages(errorQ: Queue[Throwable]) = {
+    mkDataStream(api.doubleImages, errorQ)
+  }
+  def liveImages(errorQ: Queue[Throwable]) = {
+    mkDataStream(api.liveImages, errorQ)
   }
 
   def offsetStream[R, E](eff: ZIO[R, E, Int]) = {
@@ -206,6 +222,10 @@ object db {
     def upsertCategories(categories: Seq[Category]): ZIO[Logging, Throwable, Unit]
     def upsertImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
     def upsertImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
+    def upsertDoubleImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
+    def upsertDoubleImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
+    def upsertLiveImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
+    def upsertLiveImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
     def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int): ZIO[Logging, Throwable, Array[DeviceToken]]
   }
 
@@ -278,6 +298,32 @@ object db {
             upsert("variations", variations2Upsert)
           }
 
+          override def upsertDoubleImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
+            val images2Upsert = xs.flatMap { js =>
+              root.id.int.getOption(js).map(id => js -> BSONInteger(id))
+            }
+            upsert("doubleImages", images2Upsert)
+          }
+          override def upsertDoubleImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
+            val variations2Upsert = xs.flatMap { js =>
+              root.id.string.getOption(js).map(id => js -> BSONString(id))
+            }
+            upsert("doubleImageVariations", variations2Upsert)
+          }
+
+          override def upsertLiveImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
+            val images2Upsert = xs.flatMap { js =>
+              root.id.int.getOption(js).map(id => js -> BSONInteger(id))
+            }
+            upsert("liveImages", images2Upsert)
+          }
+          override def upsertLiveImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
+            val variations2Upsert = xs.flatMap { js =>
+              root.id.string.getOption(js).map(id => js -> BSONString(id))
+            }
+            upsert("liveImageVariations", variations2Upsert)
+          }
+
 
           override def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int): ZIO[Logging, Throwable, Array[DeviceToken]] = {
             ZIO.fromFuture { implicit ec =>
@@ -315,6 +361,24 @@ object db {
       .flatMap(_.upsertImageVariations(xs))
   }
 
+  def upsertDoubleImages(xs: Seq[Json]) = {
+    ZIO.access[Has[db.Service]](_.get)
+      .flatMap(_.upsertDoubleImages(xs))
+  }
+  def upsertDoubleImageVariations(xs: Seq[Json]) = {
+    ZIO.access[Has[db.Service]](_.get)
+      .flatMap(_.upsertDoubleImageVariations(xs))
+  }
+
+  def upsertLiveImages(xs: Seq[Json]) = {
+    ZIO.access[Has[db.Service]](_.get)
+      .flatMap(_.upsertLiveImages(xs))
+  }
+  def upsertLiveImageVariations(xs: Seq[Json]) = {
+    ZIO.access[Has[db.Service]](_.get)
+      .flatMap(_.upsertLiveImageVariations(xs))
+  }
+
   def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int) = {
      ZIO.access[Has[db.Service]](_.get)
       .flatMap(_.fetch(maybeLastId, pageSize))
@@ -338,14 +402,70 @@ object logic {
     for {
       obj <- js.asObject
       id <- obj("id")
+
       variations <- obj("variations").flatMap(_.asObject)
       variationsJson = variations.asJson
+
       adaptedUrl <- root.adapted.url.string.getOption(variationsJson)
       adapted_landscapeUrl <- root.adapted_landscape.url.string.getOption(variationsJson)
       originalUrl <- root.original.url.string.getOption(variationsJson)
       preview_smallUrl <- root.preview_small.url.string.getOption(variationsJson)
+
       hash = util.md5HashString(adaptedUrl + adapted_landscapeUrl + originalUrl + preview_smallUrl)
-    } yield obj.remove("variations") -> variations.add("image_id", id).add("id", hash.asJson)
+    } yield obj.remove("variations").asJson -> variations.add("image_id", id).add("id", hash.asJson).asJson
+  }
+
+  def separateDoubleImageDataAndVariation(js: Json) = {
+    for {
+      obj <- js.asObject
+      id <- obj("id")
+
+      homeVariations <- obj("home_variations").flatMap(_.asObject)
+      lockVariations <- obj("lock_variations").flatMap(_.asObject)
+
+      homeVariationsJson = homeVariations.asJson
+      lockVariationsJson = lockVariations.asJson
+
+      homeAdaptedUrl <- root.adapted.url.string.getOption(homeVariationsJson)
+      homePreview_smallUrl <- root.preview_small.url.string.getOption(homeVariationsJson)
+
+      lockAdaptedUrl <- root.adapted.url.string.getOption(lockVariationsJson)
+      lockPreview_smallUrl <- root.preview_small.url.string.getOption(lockVariationsJson)
+
+      hash = util.md5HashString(homeAdaptedUrl + homePreview_smallUrl + lockAdaptedUrl + lockPreview_smallUrl)
+    } yield obj.remove("home_variations").remove("lock_variations").asJson -> Json.obj(
+      "double_image_id" -> id.asJson,
+      "id" -> hash.asJson,
+      "home_variations" -> homeVariationsJson,
+      "lock_variations" -> lockVariationsJson
+    )
+  }
+
+
+  def separateLiveImageDataAndVariation(js: Json) = {
+    for {
+      obj <- js.asObject
+      id <- obj("id")
+
+      imageVariations <- obj("image_variations").flatMap(_.asObject)
+      videoVariations <- obj("video_variations").flatMap(_.asObject)
+
+      imageVariationsJson = imageVariations.asJson
+      videoVariationsJson = videoVariations.asJson
+
+      imageAdaptedUrl <- root.adapted.url.string.getOption(imageVariationsJson)
+      imagePreview_smallUrl <- root.preview_small.url.string.getOption(imageVariationsJson)
+
+      videoAdaptedUrl <- root.adapted.url.string.getOption(videoVariationsJson)
+      videoPreview_smallUrl <- root.preview_small.url.string.getOption(videoVariationsJson)
+
+      hash = util.md5HashString(imageAdaptedUrl + imagePreview_smallUrl + videoAdaptedUrl + videoPreview_smallUrl)
+    } yield obj.remove("image_variations").remove("video_variations").asJson -> Json.obj(
+      "live_image_id" -> id.asJson,
+      "id" -> hash.asJson,
+      "image_variations" -> imageVariationsJson,
+      "video_variations" -> videoVariationsJson
+    )
   }
 }
 
@@ -387,14 +507,16 @@ object main extends App {
     .run(ZSink.collectAllToSet)
   }
 
-  def imageProg(errorQ: Queue[Throwable]) = {
-
-    stream.images(errorQ)
-      .mapM(js => ZIO.fromOption(logic.separateImageDataAndVariation(js)))
+  def dataProg[R1, R2, E, A, B](
+    mkExtractStream: (Queue[E]) => ZStream[R1, E, A],
+    transform: (A) => Option[(B, B)],
+    load: Chunk[(B, B)] => ZIO[R2, E, Unit],
+    errorQ: Queue[E]
+  ) = {
+    mkExtractStream(errorQ)
+      .mapM(x => ZIO.fromOption(transform(x)))
       .grouped(1024)
-      .mapMParUnordered(8) { chunk =>
-        (db.upsertImages(chunk.map(_._1.asJson)) <*> db.upsertImageVariations(chunk.map(_._2.asJson))).either
-      }
+      .mapMParUnordered(8)(x => load(x).either)
       .tap {
         case Left(throwable) =>
           errorQ.offer(throwable)
@@ -402,6 +524,27 @@ object main extends App {
       }
       .collectRight
       .run(ZSink.foldLeft(0)((acc, _) => acc + 1))
+  }
+
+  def imageProg(errorQ: Queue[Throwable]) = {
+    dataProg(stream.images, logic.separateImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
+      db.upsertImages(chunk.map(_._1)) *> db.upsertImageVariations(chunk.map(_._2))
+    }, errorQ)
+
+  }
+
+  def doubleImageProg(errorQ: Queue[Throwable]) = {
+    dataProg(stream.doubleImages, logic.separateDoubleImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
+      db.upsertDoubleImages(chunk.map(_._1)) *> db.upsertDoubleImageVariations(chunk.map(_._2))
+    }, errorQ)
+
+  }
+
+  def liveImageProg(errorQ: Queue[Throwable]) = {
+    dataProg(stream.liveImages, logic.separateLiveImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
+      db.upsertLiveImages(chunk.map(_._1)) *> db.upsertLiveImageVariations(chunk.map(_._2))
+    }, errorQ)
+
   }
 
 
@@ -422,6 +565,8 @@ object main extends App {
     for {
       categorySuccesses <- categoryProg(errorQ)
       imagesSuccesses <- imageProg(errorQ)
+      doubleImagesSuccesses <- doubleImageProg(errorQ)
+      liveImagesSuccesses <- liveImageProg(errorQ)
     } yield categorySuccesses
   }
 

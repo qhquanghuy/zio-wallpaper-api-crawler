@@ -58,6 +58,22 @@ object api {
     } yield res
   }
 
+  def liveImages(limit: Int, offset: Int, width: Int, height: Int) = {
+    for {
+      uri <- baseUri("/live-images", limit, offset, width, height)
+      req = baseReq.get(uri.addParam("content_type", "ios_live")).response(asJson[ApiResponse[Json]])
+      res <- run(req)
+    } yield res
+  }
+
+  def doubleImages(limit: Int, offset: Int, width: Int, height: Int) = {
+    for {
+      uri <- baseUri("/double-images", limit, offset, width, height)
+      req = baseReq.get(uri).response(asJson[ApiResponse[Json]])
+      res <- run(req)
+    } yield res
+  }
+
   def sendFacebookMessage(message: String) = {
 
     getConfig[FacebookConfig] >>= { config =>
