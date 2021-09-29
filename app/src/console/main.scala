@@ -241,18 +241,17 @@ object db {
               Future.sequence(updatesF).flatMap { updates => updateBuilder.many(updates) }
             }
 
-            val ids2Upsert = jsObjs.map(_._2)
+            val id2InsertHash = jsObjs.map(_._2).hashCode()
 
             for {
               _ <- if (notJsObjs.nonEmpty) log.error(s"Not Json Object: ${notJsObjs.map(_._2)}") else ZIO.unit
-              _ <- log.info(s"Loading ids: ${ids2Upsert}")
+              _ <- log.info(s"Loading ids: ${id2InsertHash}")
               result <- eff
               _ <- log.info(s"Done Loading " +
-                s"id: ${ids2Upsert} " +
+                s"id: ${id2InsertHash} " +
                 s"ok = ${result.ok} " +
                 s"n = ${result.n} " +
                 s"nModified = ${result.nModified} " +
-                s"upserted = ${result.upserted} " +
                 s"writeErrors = ${result.writeErrors} " +
                 s"writeConcernError = ${result.writeConcernError} " +
                 s"code = ${result.code} " +
@@ -392,7 +391,7 @@ object main extends App {
 
     stream.images(errorQ)
       .mapM(js => ZIO.fromOption(logic.separateImageDataAndVariation(js)))
-      .grouped(128)
+      .grouped(1024)
       .mapMParUnordered(8) { chunk =>
         (db.upsertImages(chunk.map(_._1.asJson)) <*> db.upsertImageVariations(chunk.map(_._2.asJson))).either
       }
