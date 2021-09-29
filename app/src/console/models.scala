@@ -1,10 +1,5 @@
 package console
 
-import scala.util.Try
-
-import io.circe.Decoder
-import io.circe.generic.auto._
-
 import reactivemongo.api.bson._
 
 final case class ApiResponse[A](count: Int, items: List[A])

@@ -1,18 +1,13 @@
 package console
 
-import scala.util.Try
-import scala.concurrent.duration.{Duration => ScDuration, _}
-import scala.concurrent.Future
+import scala.concurrent.duration._
 import java.time.temporal.ChronoUnit
 import java.io.File
 
 import zio._
-import zio.console._
 import zio.clock._
 import zio.stream.{ZStream, ZSink}
 import zio.config.magnolia.DeriveConfigDescriptor
-import zio.config.ZConfig
-import zio.duration.Duration
 import zio.logging._
 import zio.config.syntax._
 import zio.config.typesafe.TypesafeConfig
@@ -23,18 +18,13 @@ import sttp.capabilities._
 import sttp.client3.asynchttpclient.zio.AsyncHttpClientZioBackend
 
 import io.circe._
-import io.circe.syntax._
 import io.circe.optics.JsonPath._
-import io.circe.bson._
-import io.circe.parser._
-import io.circe.generic.auto._
 
 import reactivemongo.api._
-import reactivemongo.api.bson._
-import reactivemongo.api.bson.collection._
 
 import aliases._
-
+import transform._
+import load._
 
 
 
@@ -48,156 +38,10 @@ object constants {
 }
 
 
-object stream {
-
-
-  def previewSmall() = {
-    val widthIt = Iterator.from(600, 100).takeWhile(_ <= 4000)
-    val widthHeightIt = widthIt.flatMap(width => Iterator.from(width + 200, 100).takeWhile(_ <= 4000).map(width -> _))
-    ZStream.fromIterator(widthHeightIt)
-      .mapMPar(2) {
-        case (width, height) => api.images(1, 0, width, height)
-      }
-      .mapConcat { res =>
-        val base = root.each.variations.preview_small.resolution
-        val resolutions = base.json.getAll(res.items.asJson)
-        val widthLens = root.width.int
-        val heightLens = root.height.int
-        resolutions.flatMap { resolution =>
-          for {
-            w <- widthLens.getOption(resolution)
-            h <- heightLens.getOption(resolution)
-          } yield w -> h
-        }
-        .toSet
-      }
-  }
-
-  def dimensions = {
-    val xs = Seq(
-      (240,506),
-      (938,1668),
-      (1336,1336),
-      (480,854),
-      (256,456),
-      (360,720),
-      (600,1024),
-      (1080,1920),
-      (768,1024),
-      (1200,1920),
-      (480,986),
-      (312,556),
-      (200,342),
-      (768,1336),
-      (600,854),
-      (480,800),
-      (800,1420),
-      (266,473),
-      (240,320),
-      (480,720),
-      (240,426),
-      (480,960),
-      (854,1139),
-      (720,1280),
-      (360,780),
-      (695,927),
-      (640,854),
-      (400,640),
-      (360,640),
-      (480,1040),
-      (360,760),
-      (535,1157),
-      (320,480),
-      (469,1015),
-      (266,426),
-      (534,854),
-      (540,960),
-      (800,1280),
-      (450,800)
-    )
-    xs
-  }
-
-  def totalPage(totalItems: Int) = Math.ceil(totalItems.toDouble / constants.limit).toLong
-
-  def mkDataStream[R, E, A](dataSource: (Int, Int, Int, Int) => ZIO[R, E, ApiResponse[A]], errorQ: Queue[E]) = {
-    ZStream.fromIterable(dimensions)
-      .map {
-        case (w, h) => w * 3 -> h * 3
-      }
-      .flatMap {
-        case (w, h) => ZStream.fromEffect(offsetStream(dataSource(1, 0, w, h).map(_.count))).mapConcat(identity).map(_ -> (w, h)).either
-      }
-      .tap {
-        case Left(throwable) =>
-          errorQ.offer(throwable)
-        case _ => ZIO.unit
-      }
-      .collectRight
-      .chunkN(1).throttleShape(1, Duration.fromScala(250.millis))(_ => 1)
-      .mapMParUnordered(5) {
-        case (offset, (w, h)) => dataSource(constants.limit, offset, w, h).either
-      }
-      .tap {
-        case Left(throwable) =>
-          errorQ.offer(throwable)
-        case _ => ZIO.unit
-      }
-      .collectRight
-      .map(_.items)
-      .mapConcat(identity)
-  }
-
-  def images(errorQ: Queue[Throwable]) = {
-    mkDataStream(api.images, errorQ)
-  }
-
-  def doubleImages(errorQ: Queue[Throwable]) = {
-    mkDataStream(api.doubleImages, errorQ)
-  }
-  def liveImages(errorQ: Queue[Throwable]) = {
-    mkDataStream(api.liveImages, errorQ)
-  }
-
-  def offsetStream[R, E](eff: ZIO[R, E, Int]) = {
-    eff.map(totalPage)
-      .map(pages => Range(0, pages.toInt))
-      .map(_.map(_ * constants.limit))
-
-  }
-
-  def categories(errorQ: Queue[Throwable]) = {
-
-    val eff = offsetStream(api.categories(1, 0, 480, 640).map(_.count))
-
-    ZStream.fromEffect(eff)
-      .mapConcat(identity)
-      .mapMParUnordered(2)(api.categories(constants.limit, _, 480, 640).either)
-      .tap {
-        case Left(throwable) =>
-          errorQ.offer(throwable)
-        case _ => ZIO.unit
-      }
-      .collectRight
-      .mapConcat(_.items)
-  }
-
-  def deviceTokens() = {
-    val initState: Option[BSONObjectID] = None
-    val pageSize = 1000
-    ZStream.unfoldM(initState) { maybeLastId =>
-      db.fetch(maybeLastId, pageSize)
-        .map { xs =>
-          if (xs.isEmpty) None else Some(xs -> xs.lastOption.map(_.id))
-        }
-    }
-  }
-
-}
 
 
 object mongo {
-  import reactivemongo.api.{ AsyncDriver, MongoConnection }
+  import reactivemongo.api.AsyncDriver
 
   lazy val layer = {
     ZLayer.fromAcquireRelease(
@@ -211,179 +55,6 @@ object mongo {
   }
 }
 
-object db {
-
-
-  import reactivemongo.api.bson._
-  import reactivemongo.api.bson.collection._
-
-
-  trait Service {
-    def upsertCategories(categories: Seq[Category]): ZIO[Logging, Throwable, Unit]
-    def upsertImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
-    def upsertImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
-    def upsertDoubleImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
-    def upsertDoubleImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
-    def upsertLiveImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
-    def upsertLiveImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit]
-    def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int): ZIO[Logging, Throwable, Array[DeviceToken]]
-  }
-
-  object Service {
-
-    lazy val live = {
-      ZLayer.fromService { (pair: (DB, MongoConfig)) =>
-        val (db, conf) = pair
-        lazy val deviceTokens = db.collection("deviceTokens")
-        new Service {
-
-          private def json2BSONDoc(json: Json) = ZIO.fromEither(jsonToBson(json))
-            .collect(new IllegalArgumentException("Inserting Json  must be an Object")) { case doc: BSONDocument => doc }
-
-
-          private def upsert(collectionName: String, xs: Seq[(Json, BSONValue)]) = {
-            val collection = db.collection(collectionName)
-            val (notJsObjs, jsObjs) = xs.map {
-              case (json, id) => jsonToBson(json) -> id
-            }
-            .partition(_._1.isLeft)
-
-            val updateBuilder = collection.update
-            val updatesF = jsObjs.collect {
-              case (Right(bdoc), id) => updateBuilder.element(
-                q = BSONDocument("id" -> id),
-                u = BSONDocument("$set" -> bdoc),
-                upsert = true
-              )
-            }
-
-            val eff = ZIO.fromFuture { implicit ec =>
-              Future.sequence(updatesF).flatMap { updates => updateBuilder.many(updates) }
-            }
-
-            val id2InsertHash = jsObjs.map(_._2).hashCode()
-
-            for {
-              _ <- if (notJsObjs.nonEmpty) log.error(s"Not Json Object: ${notJsObjs.map(_._2)}") else ZIO.unit
-              _ <- log.info(s"Loading ids: ${id2InsertHash}")
-              result <- eff
-              _ <- log.info(s"Done Loading " +
-                s"id: ${id2InsertHash} " +
-                s"ok = ${result.ok} " +
-                s"n = ${result.n} " +
-                s"nModified = ${result.nModified} " +
-                s"writeErrors = ${result.writeErrors} " +
-                s"writeConcernError = ${result.writeConcernError} " +
-                s"code = ${result.code} " +
-                s"errmsg = ${result.errmsg} " +
-                s"totalN = ${result.totalN}}"
-              )
-            } yield ()
-          }
-
-          override def upsertCategories(categories: Seq[Category]) = {
-            upsert("categories", categories.map(category => category.asJson -> BSONInteger(category.id)))
-          }
-
-          override def upsertImages(xs: Seq[Json]): ZIO[Logging,Throwable,Unit] = {
-            val images2Upsert = xs.flatMap { js =>
-              root.id.int.getOption(js).map(id => js -> BSONInteger(id))
-            }
-            upsert("images", images2Upsert)
-          }
-          override def upsertImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
-            val variations2Upsert = xs.flatMap { js =>
-              root.id.string.getOption(js).map(id => js -> BSONString(id))
-            }
-            upsert("variations", variations2Upsert)
-          }
-
-          override def upsertDoubleImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
-            val images2Upsert = xs.flatMap { js =>
-              root.id.int.getOption(js).map(id => js -> BSONInteger(id))
-            }
-            upsert("doubleImages", images2Upsert)
-          }
-          override def upsertDoubleImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
-            val variations2Upsert = xs.flatMap { js =>
-              root.id.string.getOption(js).map(id => js -> BSONString(id))
-            }
-            upsert("doubleImageVariations", variations2Upsert)
-          }
-
-          override def upsertLiveImages(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
-            val images2Upsert = xs.flatMap { js =>
-              root.id.int.getOption(js).map(id => js -> BSONInteger(id))
-            }
-            upsert("liveImages", images2Upsert)
-          }
-          override def upsertLiveImageVariations(xs: Seq[Json]): ZIO[Logging, Throwable, Unit] = {
-            val variations2Upsert = xs.flatMap { js =>
-              root.id.string.getOption(js).map(id => js -> BSONString(id))
-            }
-            upsert("liveImageVariations", variations2Upsert)
-          }
-
-
-          override def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int): ZIO[Logging, Throwable, Array[DeviceToken]] = {
-            ZIO.fromFuture { implicit ec =>
-              val filter = maybeLastId
-                .map(lastId =>
-                  BSONDocument("_id" -> BSONDocument("$lt" -> lastId))
-                )
-                .getOrElse(BSONDocument())
-
-              deviceTokens.find(filter)
-                .sort(BSONDocument("_id" -> -1))
-                .cursor[DeviceToken]()
-                .collect(pageSize, Cursor.ContOnError { (a: Array[DeviceToken], throwable) =>
-                  throwable.printStackTrace()
-                })
-            }
-          }
-
-        }
-      }
-    }
-  }
-
-  def upsertCategories(categories: Seq[Category]) = {
-     ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertCategories(categories))
-  }
-
-  def upsertImages(xs: Seq[Json]) = {
-    ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertImages(xs))
-  }
-  def upsertImageVariations(xs: Seq[Json]) = {
-    ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertImageVariations(xs))
-  }
-
-  def upsertDoubleImages(xs: Seq[Json]) = {
-    ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertDoubleImages(xs))
-  }
-  def upsertDoubleImageVariations(xs: Seq[Json]) = {
-    ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertDoubleImageVariations(xs))
-  }
-
-  def upsertLiveImages(xs: Seq[Json]) = {
-    ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertLiveImages(xs))
-  }
-  def upsertLiveImageVariations(xs: Seq[Json]) = {
-    ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.upsertLiveImageVariations(xs))
-  }
-
-  def fetch(maybeLastId: Option[BSONObjectID], pageSize: Int) = {
-     ZIO.access[Has[db.Service]](_.get)
-      .flatMap(_.fetch(maybeLastId, pageSize))
-  }
-}
 
 object util {
   def md5HashString(s: String): String = {
@@ -397,77 +68,6 @@ object util {
   }
 }
 
-object logic {
-  def separateImageDataAndVariation(js: Json) = {
-    for {
-      obj <- js.asObject
-      id <- obj("id")
-
-      variations <- obj("variations").flatMap(_.asObject)
-      variationsJson = variations.asJson
-
-      adaptedUrl <- root.adapted.url.string.getOption(variationsJson)
-      adapted_landscapeUrl <- root.adapted_landscape.url.string.getOption(variationsJson)
-      originalUrl <- root.original.url.string.getOption(variationsJson)
-      preview_smallUrl <- root.preview_small.url.string.getOption(variationsJson)
-
-      hash = util.md5HashString(adaptedUrl + adapted_landscapeUrl + originalUrl + preview_smallUrl)
-    } yield obj.remove("variations").asJson -> variations.add("image_id", id).add("id", hash.asJson).asJson
-  }
-
-  def separateDoubleImageDataAndVariation(js: Json) = {
-    for {
-      obj <- js.asObject
-      id <- obj("id")
-
-      homeVariations <- obj("home_variations").flatMap(_.asObject)
-      lockVariations <- obj("lock_variations").flatMap(_.asObject)
-
-      homeVariationsJson = homeVariations.asJson
-      lockVariationsJson = lockVariations.asJson
-
-      homeAdaptedUrl <- root.adapted.url.string.getOption(homeVariationsJson)
-      homePreview_smallUrl <- root.preview_small.url.string.getOption(homeVariationsJson)
-
-      lockAdaptedUrl <- root.adapted.url.string.getOption(lockVariationsJson)
-      lockPreview_smallUrl <- root.preview_small.url.string.getOption(lockVariationsJson)
-
-      hash = util.md5HashString(homeAdaptedUrl + homePreview_smallUrl + lockAdaptedUrl + lockPreview_smallUrl)
-    } yield obj.remove("home_variations").remove("lock_variations").asJson -> Json.obj(
-      "double_image_id" -> id.asJson,
-      "id" -> hash.asJson,
-      "home_variations" -> homeVariationsJson,
-      "lock_variations" -> lockVariationsJson
-    )
-  }
-
-
-  def separateLiveImageDataAndVariation(js: Json) = {
-    for {
-      obj <- js.asObject
-      id <- obj("id")
-
-      imageVariations <- obj("image_variations").flatMap(_.asObject)
-      videoVariations <- obj("video_variations").flatMap(_.asObject)
-
-      imageVariationsJson = imageVariations.asJson
-      videoVariationsJson = videoVariations.asJson
-
-      imageAdaptedUrl <- root.adapted.url.string.getOption(imageVariationsJson)
-      imagePreview_smallUrl <- root.preview_small.url.string.getOption(imageVariationsJson)
-
-      videoAdaptedUrl <- root.adapted.url.string.getOption(videoVariationsJson)
-      videoPreview_smallUrl <- root.preview_small.url.string.getOption(videoVariationsJson)
-
-      hash = util.md5HashString(imageAdaptedUrl + imagePreview_smallUrl + videoAdaptedUrl + videoPreview_smallUrl)
-    } yield obj.remove("image_variations").remove("video_variations").asJson -> Json.obj(
-      "live_image_id" -> id.asJson,
-      "id" -> hash.asJson,
-      "image_variations" -> imageVariationsJson,
-      "video_variations" -> videoVariationsJson
-    )
-  }
-}
 
 object main extends App {
 
@@ -477,7 +77,7 @@ object main extends App {
       "Meditation Music" -> fcmConfig.meditationMusicKey,
       "Relax Sound" -> fcmConfig.relaxSoundKey
     )
-    stream.deviceTokens()
+    extract.stream.deviceTokens()
       .flatMap { deviceTokens =>
         val groups = deviceTokens.groupBy(_.appId)
         ZStream.fromIterable(groups)
@@ -502,9 +102,9 @@ object main extends App {
 
 
   def getDimension = {
-    stream
-    .previewSmall()
-    .run(ZSink.collectAllToSet)
+    extract.stream
+      .previewSmall()
+      .run(ZSink.collectAllToSet)
   }
 
   def dataProg[R1, R2, E, A, B](
@@ -527,21 +127,21 @@ object main extends App {
   }
 
   def imageProg(errorQ: Queue[Throwable]) = {
-    dataProg(stream.images, logic.separateImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
+    dataProg(extract.stream.images, logic.separateImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
       db.upsertImages(chunk.map(_._1)) *> db.upsertImageVariations(chunk.map(_._2))
     }, errorQ)
 
   }
 
   def doubleImageProg(errorQ: Queue[Throwable]) = {
-    dataProg(stream.doubleImages, logic.separateDoubleImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
+    dataProg(extract.stream.doubleImages, logic.separateDoubleImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
       db.upsertDoubleImages(chunk.map(_._1)) *> db.upsertDoubleImageVariations(chunk.map(_._2))
     }, errorQ)
 
   }
 
   def liveImageProg(errorQ: Queue[Throwable]) = {
-    dataProg(stream.liveImages, logic.separateLiveImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
+    dataProg(extract.stream.liveImages, logic.separateLiveImageDataAndVariation, { (chunk: Chunk[(Json, Json)]) =>
       db.upsertLiveImages(chunk.map(_._1)) *> db.upsertLiveImageVariations(chunk.map(_._2))
     }, errorQ)
 
@@ -549,7 +149,7 @@ object main extends App {
 
 
   def categoryProg(errorQ: Queue[Throwable]) = {
-    stream.categories(errorQ)
+    extract.stream.categories(errorQ)
       .grouped(128)
       .mapMParUnordered(32)(xs => db.upsertCategories(xs).either)
       .tap {

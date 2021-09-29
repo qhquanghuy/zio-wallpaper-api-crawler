@@ -4,7 +4,6 @@ import zio._
 import zio.config._
 import zio.logging._
 
-import sttp.client3.SttpBackend
 import sttp.capabilities.zio._
 import sttp.capabilities._
 import sttp.client3.circe._

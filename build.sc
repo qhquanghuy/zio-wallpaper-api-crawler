@@ -18,4 +18,6 @@ object app extends ScalaModule {
 
   def mainClass = Some("console.main")
 
+    def scalacOptions = Seq("-Wunused:imports")
+
 }
