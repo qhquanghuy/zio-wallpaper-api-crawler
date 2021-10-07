@@ -48,7 +48,7 @@ object mongo {
       for {
         config <- ZIO.access[MongoConf](_.get)
         driver = new AsyncDriver
-        conStr = s"mongodb://${config.user}:${config.pwd}@${config.host}:${config.port}/?readPreference=primary&ssl=false&authSource=${config.database}"
+        conStr = s"mongodb://${config.user}:${config.pwd}@${config.host}:${config.port}/${config.database}"
         conn <- ZIO.fromFuture(implicit ec => driver.connect(conStr))
       } yield conn
     )(driver => ZIO.fromFuture(implicit ec => driver.close()(1.minute)).ignore)
