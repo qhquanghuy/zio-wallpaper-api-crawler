@@ -165,9 +165,9 @@ object main extends App {
     for {
       categorySuccesses <- categoryProg(errorQ)
       imagesSuccesses <- imageProg(errorQ)
-      doubleImagesSuccesses <- doubleImageProg(errorQ)
-      liveImagesSuccesses <- liveImageProg(errorQ)
-    } yield categorySuccesses
+      // doubleImagesSuccesses <- doubleImageProg(errorQ)
+      // liveImagesSuccesses <- liveImageProg(errorQ)
+    } yield imagesSuccesses
   }
 
 
