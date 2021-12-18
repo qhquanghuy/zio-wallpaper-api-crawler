@@ -81,7 +81,7 @@ object extract {
         (800,1280),
         (450,800)
       )
-      xs
+      scala.util.Random.shuffle(xs)
     }
 
     def totalPage(totalItems: Int) = Math.ceil(totalItems.toDouble / constants.limit).toLong

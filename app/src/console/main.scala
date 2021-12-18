@@ -115,8 +115,8 @@ object main extends App {
   ) = {
     mkExtractStream(errorQ)
       .mapM(x => ZIO.fromOption(transform(x)))
-      .grouped(1024)
-      .mapMParUnordered(8)(x => load(x).either)
+      .grouped(512)
+      .mapMParUnordered(6)(x => load(x).either)
       .tap {
         case Left(throwable) =>
           errorQ.offer(throwable)
