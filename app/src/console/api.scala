@@ -44,7 +44,7 @@ object api {
   def images(limit: Int, offset: Int, width: Int, height: Int) = {
     for {
       uri <- baseUri("/images", limit, offset, width, height)
-      req = baseReq.get(uri).response(asJson[ApiResponse[Json]])
+      req = baseReq.get(uri.addParams("types[]" -> "free", "types[]" -> "private")).response(asJson[ApiResponse[Json]])
       res <- run(req)
     } yield res
   }

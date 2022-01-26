@@ -18,7 +18,6 @@ import sttp.capabilities._
 import sttp.client3.asynchttpclient.zio.AsyncHttpClientZioBackend
 
 import io.circe._
-import io.circe.optics.JsonPath._
 
 import reactivemongo.api._
 
@@ -72,33 +71,33 @@ object util {
 object main extends App {
 
 
-  def sendFCM(fcmConfig: FCMConfig) = {
-    val keys = Map(
-      "Meditation Music" -> fcmConfig.meditationMusicKey,
-      "Relax Sound" -> fcmConfig.relaxSoundKey
-    )
-    extract.stream.deviceTokens()
-      .flatMap { deviceTokens =>
-        val groups = deviceTokens.groupBy(_.appId)
-        ZStream.fromIterable(groups)
-      }
-      .mapM {
-        case (appId, deviceTokens) => api.sendFCM(keys(appId), appId, deviceTokens.map(_.deviceToken)).either
-      }
-      .tap {
-        case Right(json) => log.info(s"main::sendFCM ${json.toString()}")
-        case Left(throwable) => log.error(s"main::sendFCM", Cause.Die(throwable))
-      }
-      .run(
-        ZSink.foldLeft(0 -> 0) {
-          case ((totalSuccess, totalFailure), Right(json)) =>
-            val success = root.success.int.getOption(json).map(_ + totalSuccess).getOrElse(totalSuccess)
-            val failure = root.failure.int.getOption(json).map(_ + totalFailure).getOrElse(totalFailure)
-            success -> failure
-          case (acc, Left(throwable)) => acc
-        }
-      )
-  }
+  // def sendFCM(fcmConfig: FCMConfig) = {
+  //   val keys = Map(
+  //     "Meditation Music" -> fcmConfig.meditationMusicKey,
+  //     "Relax Sound" -> fcmConfig.relaxSoundKey
+  //   )
+  //   extract.stream.deviceTokens()
+  //     .flatMap { deviceTokens =>
+  //       val groups = deviceTokens.groupBy(_.appId)
+  //       ZStream.fromIterable(groups)
+  //     }
+  //     .mapM {
+  //       case (appId, deviceTokens) => api.sendFCM(keys(appId), appId, deviceTokens.map(_.deviceToken)).either
+  //     }
+  //     .tap {
+  //       case Right(json) => log.info(s"main::sendFCM ${json.toString()}")
+  //       case Left(throwable) => log.error(s"main::sendFCM", Cause.Die(throwable))
+  //     }
+  //     .run(
+  //       ZSink.foldLeft(0 -> 0) {
+  //         case ((totalSuccess, totalFailure), Right(json)) =>
+  //           val success = root.success.int.getOption(json).map(_ + totalSuccess).getOrElse(totalSuccess)
+  //           val failure = root.failure.int.getOption(json).map(_ + totalFailure).getOrElse(totalFailure)
+  //           success -> failure
+  //         case (acc, Left(throwable)) => acc
+  //       }
+  //     )
+  // }
 
 
   def getDimension = {

@@ -9,9 +9,6 @@ import zio.duration.Duration
 import io.circe.syntax._
 import io.circe.optics.JsonPath._
 
-import reactivemongo.api.bson._
-
-import load._
 
 object extract {
   object stream {
@@ -148,16 +145,16 @@ object extract {
         .mapConcat(_.items)
     }
 
-    def deviceTokens() = {
-      val initState: Option[BSONObjectID] = None
-      val pageSize = 1000
-      ZStream.unfoldM(initState) { maybeLastId =>
-        db.fetch(maybeLastId, pageSize)
-          .map { xs =>
-            if (xs.isEmpty) None else Some(xs -> xs.lastOption.map(_.id))
-          }
-      }
-    }
+    // def deviceTokens() = {
+    //   val initState: Option[BSONObjectID] = None
+    //   val pageSize = 1000
+    //   ZStream.unfoldM(initState) { maybeLastId =>
+    //     db.fetch(maybeLastId, pageSize)
+    //       .map { xs =>
+    //         if (xs.isEmpty) None else Some(xs -> xs.lastOption.map(_.id))
+    //       }
+    //   }
+    // }
 
   }
 
