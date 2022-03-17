@@ -24,7 +24,7 @@ Scrape data from API then load it to mongodb
 {
     "data": [
         {
-            "author": "Nizam Abdul Latheef",
+            "author": "Author",
             "favorites": 5802,
             "downloads": 23156214,
             "content_type": "free",
