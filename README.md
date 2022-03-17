@@ -1,6 +1,6 @@
 # Intro
 
-Simple ETL using zio ecosystem, reactivemongo and scala build tool mill
+Simple ETL using ZIO Stream, reactivemongo and scala build tool mill
 
 Scrape data from API then load it to mongodb
 
