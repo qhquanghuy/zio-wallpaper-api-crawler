@@ -18,7 +18,7 @@ Scrape data from API then load it to mongodb
     ]
 }
 ```
-2. /images
+2. /images?limit=1&offset=0&screen[width]=1000&screen[height]=2000&category_id=48&sort=rating
 
 ```json
 {
