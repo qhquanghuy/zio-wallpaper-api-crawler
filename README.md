@@ -2,7 +2,7 @@
 
 Simple ETL using ZIO Stream, reactivemongo and scala build tool mill
 
-Scrape data from API then load it to mongodb. Notify to facebook page when job done
+Scrape data from API then load it to mongodb. Send notifications to facebook page when job is done
 
 # APIs
 
